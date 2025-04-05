@@ -1,70 +1,73 @@
-#!/usr/bin/env Rscript
+# Load data from df and prepare for output
+# dynGENIE3
+# Polished by Kristina Gagalova
 
-#install.packages("doRNG")
-#install.packages("doParallel")
+# Read the raw counts table
+data <- read.table(gzfile("../RawCountsStar-Aka.tsv.gz"), sep="\t", header=TRUE, row.names=1)
 
-source("dynGENIE3.R")
+# Read the contrast file that contains the time and treatment columns per sample
+contrastAka <- read.csv("../contrastAka.csv", row.names=1)
 
-# Load raw count matrix and sample metadata
-raw_counts_aka <- read.delim(
-  gzfile("../RawCountsStar-Aka.tsv.gz"),
-  row.names = 1
-)
-
-contrastAka <- read.csv(
-  "../contrastAka.csv",
-  row.names = 1
-)
-
-# load regulators
-regulators <- read.csv(
-  "../DEseq_AkaPval1.in",
-  header = F
-)
-
-
-# Step 1: Keep only valid samples (present in both metadata and count matrix)
-valid_samples <- row.names(contrastAka)[row.names(contrastAka) %in% colnames(raw_counts_aka)]
+# Ensure matching samples between raw data and contrast
+valid_samples <- intersect(colnames(data), rownames(contrastAka))
 contrastAka <- contrastAka[valid_samples, ]
-raw_counts_aka_mat <- raw_counts_aka[, valid_samples]
+data <- data[, valid_samples]
 
-# Step 2: Filter genes that have zero counts in >90% of replicates per timepoint
-contrastAka_by_timepoint <- split(row.names(contrastAka), contrastAka$time)
-filtered_genes_by_tp <- list()
+# Map original time numbers to new labels
+original_times <- sort(unique(contrastAka$time))
+time_mapping <- setNames(c(0, 1, 3, 7, 9), original_times)
+contrastAka$mapped_time <- time_mapping[as.character(contrastAka$time)]
 
-for (tp in names(contrastAka_by_timepoint)) {
-  samples <- contrastAka_by_timepoint[[tp]]
-  submat <- raw_counts_aka_mat[, samples, drop = FALSE]
-  zero_counts <- rowSums(submat == 0)
-  threshold <- 0.9 * ncol(submat)
-  keep_genes <- rownames(submat)[zero_counts <= threshold]
-  message(tp, ": ", length(keep_genes), " genes kept")
-  filtered_genes_by_tp[[tp]] <- keep_genes
-}
-
-# Step 3: Keep genes that passed in all timepoints
-genes_to_keep <- Reduce(intersect, filtered_genes_by_tp)
-filtered_counts <- raw_counts_aka_mat[genes_to_keep, ]
-
-# Step 4: Compute average gene expression per timepoint
-samples_by_tp <- split(row.names(contrastAka), contrastAka$time)
-
-avg_expr_per_tp <- lapply(samples_by_tp, function(samples) {
-  submat <- filtered_counts[, samples, drop = FALSE]
-  rowMeans(submat)
+# Filter genes (>90% zero counts per timepoint)
+contrast_by_tp_treatment <- split(rownames(contrastAka), list(contrastAka$mapped_time, contrastAka$treatment))
+filtered_genes_by_group <- lapply(contrast_by_tp_treatment, function(samples) {
+  submat <- data[, samples, drop=FALSE]
+  keep_genes <- rownames(submat)[rowSums(submat == 0) <= 0.9 * ncol(submat)]
+  keep_genes
 })
 
-# Step 5: Combine into matrix (timepoints x genes), sorted by timepoint name
-TP_order <- sort(names(avg_expr_per_tp))
-TS.matrix <- do.call(rbind, avg_expr_per_tp[TP_order])
+# Intersection of genes kept in all groups
+genes_to_keep <- Reduce(intersect, filtered_genes_by_group)
+filtered_counts <- data[genes_to_keep, ]
 
-# Step 6: Prepare final TS.data list for dynGENIE3
-TS.data <- list(TS.matrix)
+# Separate data by treatment, average expression per timepoint, and write to files
+treatments <- unique(contrastAka$treatment)
 
-# Optional checks
-cat("TS.data structure:\n")
-str(TS.data)
+for (treatment in treatments) {
+  contrast_subset <- contrastAka[contrastAka$treatment == treatment, ]
+  timepoints <- sort(unique(contrast_subset$mapped_time))
+  avg_expr_matrix <- sapply(timepoints, function(tp) {
+    samples <- rownames(contrast_subset[contrast_subset$mapped_time == tp, ])
+    rowMeans(filtered_counts[, samples, drop=FALSE])
+  })
+  avg_expr_df <- data.frame(time_points = timepoints, t(avg_expr_matrix))
+  colnames(avg_expr_df) <- c("time_points", genes_to_keep)
+  write.table(avg_expr_df, file=paste0("averaged_expression_", treatment, ".txt"), sep="\t", quote=FALSE, row.names=FALSE)
+}
 
-#dyn.load("dynGENIE3_R_C_wrapper/dynGENIE3.so")
-dynGENIE3_results <- dynGENIE3(TS.data = TS.data, regulators = regulators$V1)
 
+# load data with function from package
+TS1 <- read.expr.matrix("averaged_expression_Pet.txt", form="rows.are.samples")
+TS2 <- read.expr.matrix("averaged_expression_Tox8F.txt", form="rows.are.samples")
+
+regulators <- read.csv(
+     "../DEseq_AkaPval1.in",
+     header = F
+   )
+
+# Find intersection with regulator genes
+common_genes <- Reduce(intersect, list(colnames(TS1), colnames(TS2), regulators))
+common_genes <- unlist(common_genes)
+
+# Subset dataframes to include only intersected genes
+TS1 <- TS1[, common_genes, drop=FALSE]
+TS2 <- TS2[, common_genes, drop=FALSE]
+
+
+# prepare input
+time.points <- list(unname(TS1[,1]), unname(TS2[,1]))
+
+# dynGENIE3 run
+dynGENIE3_results <- dynGENIE3(TS.data = TS.data, 
+                                time.points = time.points, 
+                                regulators = common_genes)
